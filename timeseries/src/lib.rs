@@ -60,6 +60,9 @@ mod util;
 #[cfg(feature = "bench-internals")]
 mod bench_api;
 
+#[cfg(feature = "otel")]
+pub mod otel;
+
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
@@ -79,5 +82,7 @@ pub use model::{
     InstantSample, Label, Labels, MetricMetadata, MetricType, QueryOptions, QueryValue,
     RangeSample, STALE_NAN, Sample, Series, SeriesBuilder, Temporality, is_stale_nan,
 };
+#[cfg(feature = "otel")]
+pub use otel::{OtelConfig, OtelConverter};
 pub use reader::TimeSeriesDbReader;
 pub use timeseries::TimeSeriesDb;
