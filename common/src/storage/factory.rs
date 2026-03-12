@@ -5,88 +5,152 @@
 
 use std::sync::Arc;
 
-use super::config::{BlockCacheConfig, ObjectStoreConfig, SlateDbStorageConfig, StorageConfig};
+use super::config::{BlockCacheConfig, ObjectStoreConfig, StorageConfig};
 use super::in_memory::InMemoryStorage;
 use super::slate::{SlateDbStorage, SlateDbStorageReader};
 use super::{MergeOperator, Storage, StorageError, StorageRead, StorageResult};
+use slatedb::DbReader;
 use slatedb::config::Settings;
 pub use slatedb::db_cache::CachedEntry;
 use slatedb::db_cache::DbCache;
 pub use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
 pub use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
 use slatedb::object_store::{self, ObjectStore};
-use slatedb::{DbBuilder, DbReader};
-use tokio::runtime::Handle;
+pub use slatedb::{CompactorBuilder, DbBuilder};
 use tracing::info;
 
-/// Runtime options for storage that cannot be serialized.
+/// Builder for creating storage instances from configuration.
 ///
-/// This struct holds non-serializable runtime configuration like tokio
-/// runtime handles. Users can configure these options and pass them to
-/// system builders (e.g., `LogDbBuilder`, `TsdbBuilder`).
+/// `StorageBuilder` provides layered access to the underlying SlateDB
+/// [`DbBuilder`], replacing the previous `StorageRuntime` middleman.
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// use common::StorageRuntime;
+/// use common::{StorageBuilder, StorageSemantics, create_object_store};
+/// use common::storage::factory::CompactorBuilder;
 ///
-/// // Create a separate runtime for compaction
-/// let compaction_runtime = tokio::runtime::Builder::new_multi_thread()
-///     .worker_threads(2)
-///     .enable_all()
+/// // Simple usage:
+/// let storage = StorageBuilder::new(&config.storage).await?
+///     .with_semantics(StorageSemantics::new().with_merge_operator(Arc::new(MyOp)))
 ///     .build()
-///     .unwrap();
+///     .await?;
 ///
-/// let runtime = StorageRuntime::new()
-///     .with_compaction_runtime(compaction_runtime.handle().clone());
-///
-/// // Pass to a system builder
-/// let mut builder = LogDbBuilder::new(config);
-/// *builder.storage_mut() = runtime;
-/// let log = builder.build().await?;
+/// // Escape hatch for low-level SlateDB configuration:
+/// let storage = StorageBuilder::new(&config.storage).await?
+///     .map_slatedb(|db| {
+///         let obj_store = create_object_store(&slate_config.object_store).unwrap();
+///         db.with_compactor_builder(
+///             CompactorBuilder::new(slate_config.path.clone(), obj_store)
+///                 .with_runtime(compaction_runtime.handle().clone())
+///         )
+///     })
+///     .build()
+///     .await?;
 /// ```
-#[derive(Default)]
-pub struct StorageRuntime {
-    pub(crate) compaction_runtime: Option<Handle>,
-    pub(crate) block_cache: Option<Arc<dyn DbCache>>,
+pub struct StorageBuilder {
+    inner: StorageBuilderInner,
+    semantics: StorageSemantics,
 }
 
-impl StorageRuntime {
-    /// Creates a new storage runtime with default options.
-    pub fn new() -> Self {
-        Self::default()
+enum StorageBuilderInner {
+    InMemory,
+    SlateDb(Box<DbBuilder<String>>),
+}
+
+impl StorageBuilder {
+    /// Creates a new `StorageBuilder` from a [`StorageConfig`].
+    ///
+    /// For SlateDB configs this creates a [`DbBuilder`] with the configured
+    /// path, object store, settings, and block cache (if configured). For
+    /// InMemory configs it stores a sentinel so that `build()` returns an
+    /// `InMemoryStorage`.
+    pub async fn new(config: &StorageConfig) -> StorageResult<Self> {
+        let inner = match config {
+            StorageConfig::InMemory => StorageBuilderInner::InMemory,
+            StorageConfig::SlateDb(slate_config) => {
+                let object_store = create_object_store(&slate_config.object_store)?;
+                let settings = match &slate_config.settings_path {
+                    Some(path) => Settings::from_file(path).map_err(|e| {
+                        StorageError::Storage(format!(
+                            "Failed to load SlateDB settings from {}: {}",
+                            path, e
+                        ))
+                    })?,
+                    None => Settings::load().unwrap_or_default(),
+                };
+                info!(
+                    "create slatedb storage with config: {:?}, settings: {:?}",
+                    slate_config, settings
+                );
+                let mut db_builder =
+                    DbBuilder::new(slate_config.path.clone(), object_store).with_settings(settings);
+                if let Some(cache) =
+                    create_block_cache_from_config(&slate_config.block_cache).await?
+                {
+                    db_builder = db_builder.with_db_cache(cache);
+                }
+                StorageBuilderInner::SlateDb(Box::new(db_builder))
+            }
+        };
+        Ok(Self {
+            inner,
+            semantics: StorageSemantics::default(),
+        })
     }
 
-    /// Sets a separate runtime for SlateDB compaction tasks.
-    ///
-    /// When provided, SlateDB's compaction tasks will run on this runtime
-    /// instead of the runtime used for user operations. This is important
-    /// when calling the database from sync code using `block_on`, as it
-    /// prevents deadlocks between user operations and background compaction.
-    ///
-    /// This option only affects SlateDB storage; it is ignored for in-memory storage.
-    pub fn with_compaction_runtime(mut self, handle: Handle) -> Self {
-        self.compaction_runtime = Some(handle);
+    /// Sets the [`StorageSemantics`] (merge operator, etc.) for this builder.
+    pub fn with_semantics(mut self, semantics: StorageSemantics) -> Self {
+        self.semantics = semantics;
         self
     }
 
-    /// Sets a block cache for SlateDB reads.
+    /// Maps over the underlying [`DbBuilder`] for low-level SlateDB configuration.
     ///
-    /// When provided, SlateDB will use this cache for SST block lookups,
-    /// reducing disk I/O on repeated reads. Use `FoyerCache::new_with_opts`
-    /// to control capacity.
+    /// This is the escape hatch for any SlateDB knob not exposed by
+    /// `StorageBuilder` itself (compactor builder, block cache, GC runtime, etc.).
+    /// Use `db.with_db_cache(...)` inside the closure to override the
+    /// config-driven block cache.
     ///
-    /// This option only affects SlateDB storage; it is ignored for in-memory storage.
-    pub fn with_block_cache(mut self, cache: Arc<dyn DbCache>) -> Self {
-        self.block_cache = Some(cache);
+    /// For InMemory storage this is a no-op.
+    pub fn map_slatedb(mut self, f: impl FnOnce(DbBuilder<String>) -> DbBuilder<String>) -> Self {
+        if let StorageBuilderInner::SlateDb(db) = self.inner {
+            self.inner = StorageBuilderInner::SlateDb(Box::new(f(*db)));
+        }
         self
+    }
+
+    /// Builds the storage instance.
+    ///
+    /// Applies semantics (merge operator) to the `DbBuilder` and calls `.build()`.
+    pub async fn build(self) -> StorageResult<Arc<dyn Storage>> {
+        match self.inner {
+            StorageBuilderInner::InMemory => {
+                let storage = match self.semantics.merge_operator {
+                    Some(op) => InMemoryStorage::with_merge_operator(op),
+                    None => InMemoryStorage::new(),
+                };
+                Ok(Arc::new(storage))
+            }
+            StorageBuilderInner::SlateDb(db_builder) => {
+                let mut db_builder = *db_builder;
+                if let Some(op) = self.semantics.merge_operator {
+                    let adapter = SlateDbStorage::merge_operator_adapter(op);
+                    db_builder = db_builder.with_merge_operator(Arc::new(adapter));
+                }
+                let db = db_builder.build().await.map_err(|e| {
+                    StorageError::Storage(format!("Failed to create SlateDB: {}", e))
+                })?;
+                Ok(Arc::new(SlateDbStorage::new(Arc::new(db))))
+            }
+        }
     }
 }
 
 /// Runtime options for read-only storage instances.
 ///
 /// This struct holds non-serializable runtime configuration for `DbReader`.
-/// Unlike `StorageRuntime`, it only exposes options relevant to readers
+/// Unlike `StorageBuilder`, it only exposes options relevant to readers
 /// (currently just block cache).
 #[derive(Default)]
 pub struct StorageReaderRuntime {
@@ -129,7 +193,10 @@ impl StorageReaderRuntime {
 /// // In timeseries crate:
 /// let semantics = StorageSemantics::new()
 ///     .with_merge_operator(Arc::new(TimeSeriesMergeOperator));
-/// let storage = create_storage(&config, runtime, semantics).await?;
+/// let storage = StorageBuilder::new(&config).await?
+///     .with_semantics(semantics)
+///     .build()
+///     .await?;
 /// ```
 #[derive(Default)]
 pub struct StorageSemantics {
@@ -181,53 +248,6 @@ pub fn create_object_store(config: &ObjectStoreConfig) -> StorageResult<Arc<dyn 
                 StorageError::Storage(format!("Failed to create local filesystem store: {}", e))
             })?;
             Ok(Arc::new(store))
-        }
-    }
-}
-
-/// Creates a storage instance based on configuration, runtime options, and semantics.
-///
-/// This is the primary factory function for creating storage backends. It combines:
-/// - `config`: Serializable storage configuration (backend type, paths, etc.)
-/// - `runtime`: Non-serializable runtime options (compaction runtime handle)
-/// - `semantics`: System-specific semantics (merge operators)
-///
-/// # Arguments
-///
-/// * `config` - The storage configuration specifying the backend type and settings.
-/// * `runtime` - Runtime options like compaction runtime handles.
-/// * `semantics` - System-specific semantics like merge operators.
-///
-/// # Returns
-///
-/// Returns an `Arc<dyn Storage>` on success, or a `StorageError` on failure.
-///
-/// # Example (for system crate implementers)
-///
-/// ```rust,ignore
-/// // In a system crate's builder:
-/// let storage = create_storage(
-///     &self.config.storage,
-///     self.storage_runtime.unwrap_or_default(),
-///     StorageSemantics::new().with_merge_operator(Arc::new(MyMergeOp)),
-/// ).await?;
-/// ```
-pub async fn create_storage(
-    config: &StorageConfig,
-    runtime: StorageRuntime,
-    semantics: StorageSemantics,
-) -> StorageResult<Arc<dyn Storage>> {
-    match config {
-        StorageConfig::InMemory => {
-            let storage = match semantics.merge_operator {
-                Some(op) => InMemoryStorage::with_merge_operator(op),
-                None => InMemoryStorage::new(),
-            };
-            Ok(Arc::new(storage))
-        }
-        StorageConfig::SlateDb(slate_config) => {
-            let storage = create_slatedb_storage(slate_config, runtime, semantics).await?;
-            Ok(Arc::new(storage))
         }
     }
 }
@@ -293,58 +313,6 @@ pub async fn create_storage_read(
             Ok(Arc::new(SlateDbStorageReader::new(Arc::new(reader))))
         }
     }
-}
-
-async fn create_slatedb_storage(
-    config: &SlateDbStorageConfig,
-    runtime: StorageRuntime,
-    semantics: StorageSemantics,
-) -> StorageResult<SlateDbStorage> {
-    let object_store = create_object_store(&config.object_store)?;
-
-    // Load SlateDB settings
-    let settings = match &config.settings_path {
-        Some(path) => Settings::from_file(path).map_err(|e| {
-            StorageError::Storage(format!(
-                "Failed to load SlateDB settings from {}: {}",
-                path, e
-            ))
-        })?,
-        None => Settings::load().unwrap_or_default(),
-    };
-
-    info!(
-        "create slatedb storage with config: {:?}, settings: {:?}",
-        config, settings
-    );
-
-    // Build the database
-    let mut db_builder = DbBuilder::new(config.path.clone(), object_store).with_settings(settings);
-
-    // Add merge operator if provided
-    if let Some(op) = semantics.merge_operator {
-        let adapter = SlateDbStorage::merge_operator_adapter(op);
-        db_builder = db_builder.with_merge_operator(Arc::new(adapter));
-    }
-
-    // Add compaction runtime if provided
-    if let Some(handle) = runtime.compaction_runtime {
-        db_builder = db_builder.with_gc_runtime(handle);
-    }
-
-    // Add block cache: prefer runtime-provided cache, fall back to config
-    if let Some(cache) = runtime.block_cache {
-        db_builder = db_builder.with_db_cache(cache);
-    } else if let Some(cache) = create_block_cache_from_config(&config.block_cache).await? {
-        db_builder = db_builder.with_db_cache(cache);
-    }
-
-    let db = db_builder
-        .build()
-        .await
-        .map_err(|e| StorageError::Storage(format!("Failed to create SlateDB: {}", e)))?;
-
-    Ok(SlateDbStorage::new(Arc::new(db)))
 }
 
 /// Creates a block cache from the serializable config, if present.
@@ -437,7 +405,7 @@ mod tests {
             })),
         });
 
-        let storage = create_storage(&config, StorageRuntime::new(), StorageSemantics::new()).await;
+        let storage = StorageBuilder::new(&config).await.unwrap().build().await;
 
         assert!(
             storage.is_ok(),
@@ -465,13 +433,12 @@ mod tests {
         };
 
         // First open a writer so the reader has a manifest to read
-        let writer = create_storage(
-            &StorageConfig::SlateDb(slate_config.clone()),
-            StorageRuntime::new(),
-            StorageSemantics::new(),
-        )
-        .await
-        .unwrap();
+        let writer = StorageBuilder::new(&StorageConfig::SlateDb(slate_config.clone()))
+            .await
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
         // Close writer before opening reader (SlateDB fencing)
         drop(writer);
 
@@ -539,41 +506,14 @@ mod tests {
             bad_path.to_str().unwrap(),
         );
 
-        // Isolate the expected panic to just the create_storage call
+        // Isolate the expected panic to just the build call
         let handle = tokio::spawn(async move {
-            let _ = create_storage(&config, StorageRuntime::new(), StorageSemantics::new()).await;
+            let _ = StorageBuilder::new(&config).await.unwrap().build().await;
         });
         let result = handle.await;
         assert!(
             result.is_err() && result.unwrap_err().is_panic(),
             "expected foyer to panic on invalid disk_path"
-        );
-    }
-
-    #[tokio::test]
-    async fn runtime_cache_should_take_precedence_over_config_cache() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Use a regular file as disk_path — deterministically invalid
-        let bad_path = tmp.path().join("not-a-dir");
-        std::fs::write(&bad_path, b"").unwrap();
-
-        let config = config_with_invalid_block_cache_disk_path(
-            &tmp.path().join("obj"),
-            bad_path.to_str().unwrap(),
-        );
-
-        // Provide a runtime cache — config cache should be skipped entirely
-        let runtime_cache = FoyerCache::new_with_opts(FoyerCacheOptions {
-            max_capacity: 1024 * 1024,
-            shards: 1,
-        });
-        let runtime = StorageRuntime::new().with_block_cache(Arc::new(runtime_cache));
-
-        let result = create_storage(&config, runtime, StorageSemantics::new()).await;
-
-        assert!(
-            result.is_ok(),
-            "runtime cache should take precedence, skipping invalid config cache"
         );
     }
 
@@ -597,14 +537,13 @@ mod tests {
         };
 
         // First open a writer (without cache) so the reader has a manifest
-        let writer = create_storage(
-            &StorageConfig::SlateDb(SlateDbStorageConfig {
-                block_cache: None,
-                ..slate_config.clone()
-            }),
-            StorageRuntime::new(),
-            StorageSemantics::new(),
-        )
+        let writer = StorageBuilder::new(&StorageConfig::SlateDb(SlateDbStorageConfig {
+            block_cache: None,
+            ..slate_config.clone()
+        }))
+        .await
+        .unwrap()
+        .build()
         .await
         .unwrap();
         drop(writer);
@@ -646,14 +585,13 @@ mod tests {
         };
 
         // First open a writer (without cache) so the reader has a manifest
-        let writer = create_storage(
-            &StorageConfig::SlateDb(SlateDbStorageConfig {
-                block_cache: None,
-                ..slate_config.clone()
-            }),
-            StorageRuntime::new(),
-            StorageSemantics::new(),
-        )
+        let writer = StorageBuilder::new(&StorageConfig::SlateDb(SlateDbStorageConfig {
+            block_cache: None,
+            ..slate_config.clone()
+        }))
+        .await
+        .unwrap()
+        .build()
         .await
         .unwrap();
         drop(writer);
@@ -690,7 +628,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config = slatedb_config_with_local_dir(tmp.path());
 
-        let storage = create_storage(&config, StorageRuntime::new(), StorageSemantics::new()).await;
+        let storage = StorageBuilder::new(&config).await.unwrap().build().await;
 
         assert!(storage.is_ok());
     }
