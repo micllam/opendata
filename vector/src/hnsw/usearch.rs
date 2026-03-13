@@ -416,4 +416,90 @@ mod tests {
         graph.remove_centroid(2).unwrap();
         assert_eq!(graph.get_centroid_vector(2), None);
     }
+
+    /// Helper to normalize a vector to unit length (simulating ingest-time normalization).
+    fn normalize(v: &[f32]) -> Vec<f32> {
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter().map(|x| x / norm).collect()
+    }
+
+    #[test]
+    fn should_build_and_search_cosine_graph() {
+        // given - 3 normalized centroids along axes
+        let centroids = vec![
+            CentroidEntry::new(1, normalize(&[1.0, 0.0, 0.0])),
+            CentroidEntry::new(2, normalize(&[0.0, 1.0, 0.0])),
+            CentroidEntry::new(3, normalize(&[0.0, 0.0, 1.0])),
+        ];
+
+        // when - query closest to centroid 1
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::Cosine).unwrap();
+        let query = normalize(&[0.9, 0.1, 0.1]);
+        let results = graph.search(&query, 1);
+
+        // then
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], 1);
+    }
+
+    #[test]
+    fn should_return_cosine_neighbors_in_similarity_order() {
+        // given - 4 normalized centroids
+        let centroids = vec![
+            CentroidEntry::new(1, normalize(&[1.0, 0.0])),
+            CentroidEntry::new(2, normalize(&[1.0, 1.0])),
+            CentroidEntry::new(3, normalize(&[0.0, 1.0])),
+            CentroidEntry::new(4, normalize(&[-1.0, 0.0])),
+        ];
+
+        // when - query along x-axis
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::Cosine).unwrap();
+        let query = normalize(&[1.0, 0.0]);
+        let results = graph.search(&query, 4);
+
+        // then - ordered by angular similarity: 1 (0°), 2 (45°), 3 (90°), 4 (180°)
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0], 1);
+        assert_eq!(results[1], 2);
+        assert_eq!(results[2], 3);
+        assert_eq!(results[3], 4);
+    }
+
+    #[test]
+    fn should_add_and_find_centroid_with_cosine() {
+        // given - 2 normalized centroids
+        let centroids = vec![
+            CentroidEntry::new(1, normalize(&[1.0, 0.0, 0.0])),
+            CentroidEntry::new(2, normalize(&[0.0, 1.0, 0.0])),
+        ];
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::Cosine).unwrap();
+
+        // when - add a third centroid and search near it
+        let new_entry = CentroidEntry::new(3, normalize(&[0.0, 0.0, 1.0]));
+        graph.add_centroid(&new_entry).unwrap();
+
+        // then
+        assert_eq!(graph.len(), 3);
+        let results = graph.search(&normalize(&[0.0, 0.0, 0.9]), 1);
+        assert_eq!(results[0], 3);
+    }
+
+    #[test]
+    fn should_remove_centroid_with_cosine() {
+        // given - 3 normalized centroids
+        let centroids = vec![
+            CentroidEntry::new(1, normalize(&[1.0, 0.0, 0.0])),
+            CentroidEntry::new(2, normalize(&[0.0, 1.0, 0.0])),
+            CentroidEntry::new(3, normalize(&[0.0, 0.0, 1.0])),
+        ];
+        let graph = UsearchCentroidGraph::build(centroids, DistanceMetric::Cosine).unwrap();
+
+        // when - remove centroid 2
+        graph.remove_centroid(2).unwrap();
+
+        // then - centroid 2 should not appear in results
+        assert_eq!(graph.len(), 2);
+        let results = graph.search(&normalize(&[0.0, 1.0, 0.0]), 3);
+        assert!(!results.contains(&2));
+    }
 }

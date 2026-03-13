@@ -1204,10 +1204,10 @@ mod tests {
         // All vectors have different magnitudes but distinct directions.
         // After normalization, cosine ranks purely by angle.
         let vectors = vec![
-            Vector::new("same-dir", vec![5.0, 0.0]),       // 0 degrees from query
-            Vector::new("slight-angle", vec![10.0, 1.0]),   // ~5.7 degrees
-            Vector::new("diagonal", vec![1.0, 1.0]),        // 45 degrees
-            Vector::new("orthogonal", vec![0.0, 3.0]),      // 90 degrees
+            Vector::new("same-dir", vec![5.0, 0.0]), // 0 degrees from query
+            Vector::new("slight-angle", vec![10.0, 1.0]), // ~5.7 degrees
+            Vector::new("diagonal", vec![1.0, 1.0]), // 45 degrees
+            Vector::new("orthogonal", vec![0.0, 3.0]), // 90 degrees
         ];
         db.write(vectors).await.unwrap();
         db.flush().await.unwrap();
