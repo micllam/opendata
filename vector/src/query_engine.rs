@@ -1110,4 +1110,130 @@ mod tests {
             other => panic!("expected vector field, got: {:?}", other),
         }
     }
+
+    // --- Cosine normalization tests ---
+
+    #[tokio::test]
+    async fn should_normalize_vectors_on_write_for_cosine_metric() {
+        // given - a database with Cosine metric and non-unit vectors at different angles
+        // Normalization is internal: stored attributes retain original values,
+        // but distance computation uses normalized vectors.
+        let config = create_config(3, DistanceMetric::Cosine);
+        let db = VectorDb::open(config).await.unwrap();
+
+        // Two vectors pointing in the same direction but with very different magnitudes
+        // should be equidistant from a query in the same direction under cosine.
+        let vectors = vec![
+            Vector::new("small", vec![1.0, 0.0, 0.0]),
+            Vector::new("large", vec![100.0, 0.0, 0.0]),
+        ];
+        db.write(vectors).await.unwrap();
+        db.flush().await.unwrap();
+
+        // when - search for a vector in the same direction
+        let results = db
+            .query_engine()
+            .search(&Query::new(vec![5.0, 0.0, 0.0]).with_limit(2))
+            .await
+            .unwrap();
+
+        // then - both vectors should have the same score (cosine distance = 0)
+        // because normalization makes magnitude irrelevant
+        assert_eq!(results.len(), 2);
+        assert!(
+            (results[0].score - results[1].score).abs() < 1e-6,
+            "Cosine distances should be equal for same-direction vectors: {} vs {}",
+            results[0].score,
+            results[1].score
+        );
+    }
+
+    #[tokio::test]
+    async fn should_not_normalize_vectors_on_write_for_l2_metric() {
+        // given - a database with L2 metric and a non-unit vector
+        let config = create_config(3, DistanceMetric::L2);
+        let db = VectorDb::open(config).await.unwrap();
+
+        let vector = Vector::new("vec-1", vec![3.0, 4.0, 0.0]);
+        db.write(vec![vector]).await.unwrap();
+        db.flush().await.unwrap();
+
+        // when
+        let record = db.get("vec-1").await.unwrap().unwrap();
+
+        // then - stored vector should be unchanged
+        match record.attribute(VECTOR_FIELD_NAME) {
+            Some(AttributeValue::Vector(v)) => assert_eq!(v, &[3.0, 4.0, 0.0]),
+            other => panic!("expected vector field, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_search_cosine_with_unnormalized_query() {
+        // given - Cosine database with normalized stored vectors
+        let config = create_config(3, DistanceMetric::Cosine);
+        let db = VectorDb::open(config).await.unwrap();
+
+        // Vectors pointing in different directions (will be normalized on write)
+        let vectors = vec![
+            Vector::new("along-x", vec![10.0, 0.0, 0.0]),
+            Vector::new("along-y", vec![0.0, 10.0, 0.0]),
+            Vector::new("along-z", vec![0.0, 0.0, 10.0]),
+        ];
+        db.write(vectors).await.unwrap();
+        db.flush().await.unwrap();
+
+        // when - query with an unnormalized vector pointing mostly along x
+        let results = db
+            .query_engine()
+            .search(&Query::new(vec![100.0, 1.0, 0.0]).with_limit(3))
+            .await
+            .unwrap();
+
+        // then - "along-x" should be most similar (smallest angle)
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].vector.id, "along-x");
+    }
+
+    #[tokio::test]
+    async fn should_rank_cosine_by_angular_similarity() {
+        // given - Cosine database with vectors at different angles from query direction
+        let config = create_config(2, DistanceMetric::Cosine);
+        let db = VectorDb::open(config).await.unwrap();
+
+        // All vectors have different magnitudes but distinct directions.
+        // After normalization, cosine ranks purely by angle.
+        let vectors = vec![
+            Vector::new("same-dir", vec![5.0, 0.0]),       // 0 degrees from query
+            Vector::new("slight-angle", vec![10.0, 1.0]),   // ~5.7 degrees
+            Vector::new("diagonal", vec![1.0, 1.0]),        // 45 degrees
+            Vector::new("orthogonal", vec![0.0, 3.0]),      // 90 degrees
+        ];
+        db.write(vectors).await.unwrap();
+        db.flush().await.unwrap();
+
+        // when - query along x-axis (unnormalized - engine should normalize)
+        let results = db
+            .query_engine()
+            .search(&Query::new(vec![50.0, 0.0]).with_limit(4))
+            .await
+            .unwrap();
+
+        // then - ranked by angle: same-dir < slight-angle < diagonal < orthogonal
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0].vector.id, "same-dir");
+        assert_eq!(results[1].vector.id, "slight-angle");
+        assert_eq!(results[2].vector.id, "diagonal");
+        assert_eq!(results[3].vector.id, "orthogonal");
+
+        // scores should be increasing (lower cosine distance = more similar)
+        for i in 1..results.len() {
+            assert!(
+                results[i - 1].score <= results[i].score,
+                "Cosine distances not sorted correctly: {} > {}",
+                results[i - 1].score,
+                results[i].score
+            );
+        }
+    }
 }
