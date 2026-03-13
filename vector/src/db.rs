@@ -532,6 +532,10 @@ impl VectorDb {
             )));
         }
 
+        // Normalize vector if metric requires it.
+        let mut values = values;
+        self.config.distance_metric.normalize_if_needed(&mut values);
+
         // Validate attributes against schema (if schema is defined)
         if !self.config.metadata_fields.is_empty() {
             self.validate_attributes(&attributes)?;

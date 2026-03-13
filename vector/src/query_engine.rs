@@ -48,6 +48,14 @@ impl QueryEngine {
         }
     }
 
+    /// Normalize the query vector if required by distance metric.
+    /// Returns a (possibly normalized) copy of the query vector.
+    fn normalize_query_if_needed(&self, query: &[f32]) -> Vec<f32> {
+        let mut v = query.to_vec();
+        self.options.distance_metric.normalize_if_needed(&mut v);
+        v
+    }
+
     pub(crate) async fn get(&self, id: &str) -> Result<Option<Vector>> {
         // 1. Lookup internal ID from IdDictionary
         let Some(internal_id) = self.storage.lookup_internal_id(id).await? else {
@@ -100,15 +108,18 @@ impl QueryEngine {
             )));
         }
 
+        // Normalize query vector if required.
+        let query_vector = self.normalize_query_if_needed(&query.vector);
+
         // Brute-force: compute distance from query to every centroid
         let num_centroids = self.centroid_graph.len();
-        let all_centroid_ids = self.centroid_graph.search(&query.vector, num_centroids);
+        let all_centroid_ids = self.centroid_graph.search(&query_vector, num_centroids);
         let mut scored: Vec<(u64, distance::VectorDistance)> = all_centroid_ids
             .iter()
             .filter_map(|&cid| {
                 let cv = self.centroid_graph.get_centroid_vector(cid)?;
                 let d =
-                    distance::compute_distance(&query.vector, &cv, self.options.distance_metric);
+                    distance::compute_distance(&query_vector, &cv, self.options.distance_metric);
                 Some((cid, d))
             })
             .collect();
@@ -119,9 +130,9 @@ impl QueryEngine {
             return Ok(Vec::new());
         }
 
-        let centroid_ids = self.prune_centroids(&centroid_ids, &query.vector);
+        let centroid_ids = self.prune_centroids(&centroid_ids, &query_vector);
 
-        let mut sorted_lists = self.load_and_score(&centroid_ids, &query.vector).await?;
+        let mut sorted_lists = self.load_and_score(&centroid_ids, &query_vector).await?;
         if sorted_lists.is_empty() {
             return Ok(Vec::new());
         }
@@ -148,9 +159,12 @@ impl QueryEngine {
             )));
         }
 
-        // 2. Search HNSW for nearest centroids
+        // 2. Normalize query vector if required.
+        let query_vector = self.normalize_query_if_needed(&query.vector);
+
+        // 3. Search HNSW for nearest centroids
         let num_centroids = nprobe;
-        let centroid_ids = self.centroid_graph.search(&query.vector, num_centroids);
+        let centroid_ids = self.centroid_graph.search(&query_vector, num_centroids);
         debug!(
             "searched for {} centroids, found: {}",
             num_centroids,
@@ -161,29 +175,29 @@ impl QueryEngine {
             return Ok(Vec::new());
         }
 
-        // 3. Dynamic pruning: skip posting lists whose centroids are far from query
+        // 4. Dynamic pruning: skip posting lists whose centroids are far from query
         let original_ncentroids = centroid_ids.len();
-        let centroid_ids = self.prune_centroids(&centroid_ids, &query.vector);
+        let centroid_ids = self.prune_centroids(&centroid_ids, &query_vector);
         debug!(
             "query: {:?}, before pruning: {} centroids, after dynamic pruning: {} centroids",
-            query.vector,
+            query_vector,
             original_ncentroids,
             centroid_ids.len()
         );
 
-        // 4. Load posting lists and score candidates
-        let mut sorted_lists = self.load_and_score(&centroid_ids, &query.vector).await?;
+        // 5. Load posting lists and score candidates
+        let mut sorted_lists = self.load_and_score(&centroid_ids, &query_vector).await?;
 
         if sorted_lists.is_empty() {
             return Ok(Vec::new());
         }
 
-        // 5. Apply metadata filter (if provided)
+        // 6. Apply metadata filter (if provided)
         if let Some(filter) = &query.filter {
             Self::apply_filter(&mut sorted_lists, filter, self.storage.as_ref()).await?;
         }
 
-        // 6. K-way merge and resolve top-k forward index lookups
+        // 7. K-way merge and resolve top-k forward index lookups
         self.resolve_top_k(sorted_lists, query.limit).await
     }
 

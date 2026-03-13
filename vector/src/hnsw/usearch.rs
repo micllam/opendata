@@ -76,9 +76,10 @@ impl UsearchCentroidGraph {
             }
         }
 
-        // Convert distance metric to usearch MetricKind
+        // Convert distance metric to usearch MetricKind.
+        // Cosine is handled by normalizing vectors at ingest, so use L2 here.
         let metric = match distance_metric {
-            DistanceMetric::L2 => MetricKind::L2sq,
+            DistanceMetric::L2 | DistanceMetric::Cosine => MetricKind::L2sq,
             DistanceMetric::DotProduct => MetricKind::IP,
         };
 
