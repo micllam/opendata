@@ -98,7 +98,7 @@ name = "otel_ingest"
 required-features = ["testing", "otel", "http-server"]
 
 [[bench]]
-name = "evaluator_micorbench"
+name = "v2_engine_micorbench"
 harness = false
 required-features = ["bench-internals"]
 
